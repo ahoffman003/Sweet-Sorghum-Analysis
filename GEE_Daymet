@@ -1,0 +1,178 @@
+var chunkStart = 0;
+var chunkSize  = 500;
+
+// =====================================================================
+// DAYMET → 10-YEAR DAILY CLIMATOLOGY → DSSAT CHUNKS (500-STATION CHUNKS)
+//  - 2015–2024 climatology (DOY 1–365)
+//  - Exports stations in small chunks to avoid memory limits
+// =====================================================================
+
+
+// ---------------------------
+// 0) FIX STATIONS GEOMETRY & ADD INDEX
+// ---------------------------
+
+var stations_raw = ee.FeatureCollection(
+  'projects/concise-ranger-473122-t8/assets/Weather_Sample_Points_Land'
+);
+
+var lonField = 'POINT_X';
+var latField = 'POINT_Y';
+var idField  = 'pointid';
+
+// Rebuild geometries from POINT_X / POINT_Y
+var stations_fixed = stations_raw.map(function(f) {
+  var lon = ee.Number(f.get(lonField));
+  var lat = ee.Number(f.get(latField));
+  var geom = ee.Geometry.Point([lon, lat]);
+  return ee.Feature(geom, f.toDictionary());
+});
+
+// Add an index "idx" (0..N-1) so we can chunk
+var count = stations_fixed.size();
+var stationsList = stations_fixed.toList(count);
+
+var stations = ee.FeatureCollection(
+  ee.List.sequence(0, count.subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var f = ee.Feature(stationsList.get(i));
+    return f.set('idx', i);
+  })
+);
+
+// Tiny, safe print
+print('Total stations:', stations.size());
+
+
+// ---------------------------
+// 1) LOAD DAYMET & ADD DOY
+// ---------------------------
+
+var daymet = ee.ImageCollection('NASA/ORNL/DAYMET_V4')
+  .filterDate('2015-01-01', '2024-12-31')
+  .select(['tmin', 'tmax', 'prcp', 'srad', 'vp', 'dayl']);
+
+var daymetWithDOY = daymet.map(function(img) {
+  var t = ee.Date(img.get('system:time_start'));
+  var doy = t.getRelative('day', 'year').add(1);  // 1..365
+  return img.set('doy', doy);
+});
+
+// Optional sanity print (scalar only):
+// print('Example DOY:', daymetWithDOY.first().get('doy'));
+
+
+// ---------------------------
+// 2) BUILD 365-DAY CLIMATOLOGY
+// ---------------------------
+
+var days = ee.List.sequence(1, 365);
+
+var dailyClimo = ee.ImageCollection(
+  days.map(function(d) {
+    d = ee.Number(d);
+
+    var sameDOY = daymetWithDOY.filter(ee.Filter.eq('doy', d));
+    var meanImg = sameDOY.mean();
+
+    // SRAD: W/m2 * seconds / 1e6 = MJ/m2/day
+    var srad_MJ = meanImg.select('srad')
+      .multiply(meanImg.select('dayl'))
+      .divide(1e6)
+      .rename('srad_MJ');
+
+    // VP: Pa -> kPa
+    var vp_kPa = meanImg.select('vp')
+      .multiply(0.001)
+      .rename('vp_kPa');
+
+    var out = meanImg.select(['tmin', 'tmax', 'prcp'])
+      .addBands(srad_MJ)
+      .addBands(vp_kPa)
+      .set('doy', d)
+      .set('system:index', d.format('%03d'));
+
+    return out;
+  })
+);
+
+// Optional: just count (scalar), but safe
+print('dailyClimo image count:', dailyClimo.size());  // should be 365
+
+
+// ---------------------------
+// 3) STACK TO MULTI-BAND IMAGE
+// ---------------------------
+
+var stacked = dailyClimo.toBands();
+
+// Rename bands "001_tmin" -> "tmin_001"
+var oldNames = stacked.bandNames();
+
+var newNames = oldNames.map(function(name) {
+  name = ee.String(name);             // e.g. "001_tmin"
+  var parts = name.split('_');        // ["001", "tmin"]
+  var doyStr = ee.String(parts.get(0));   // "001"
+  var varName = ee.String(parts.get(1));  // "tmin"
+  return varName.cat('_').cat(doyStr);    // "tmin_001"
+});
+
+stacked = stacked.rename(newNames);
+
+// Just count bands (scalar)
+print('Band count:', stacked.bandNames().size());  // should be 1825
+
+
+// ---------------------------
+// 4) DEFINE A SMALL CHUNK OF STATIONS
+// ---------------------------
+
+// >>>>> THIS IS WHAT YOU CHANGE BETWEEN RUNS <<<<<
+var chunkSize  = 500;   // stations per chunk (SMALL)
+var chunkStart = 0;     // change this: 0, 500, 1000, 1500, ...
+
+var chunkEnd = chunkStart + chunkSize;
+
+// Filter stations to this chunk
+var stations_chunk = stations.filter(
+  ee.Filter.and(
+    ee.Filter.gte('idx', chunkStart),
+    ee.Filter.lt('idx', chunkEnd)
+  )
+);
+
+// Check chunk size (scalar)
+print('Chunk start:', chunkStart, 'Chunk end:', chunkEnd);
+print('Chunk station count:', stations_chunk.size());
+
+
+// ---------------------------
+// 5) SAMPLE THIS CHUNK
+// ---------------------------
+
+var props = idField ? [idField, 'idx'] : ['idx'];
+
+var sampled_chunk = stacked.sampleRegions({
+  collection: stations_chunk,
+  properties: props,
+  scale: 1000,
+  tileScale: 1,   // keep tiles small to reduce memory per tile
+  geometries: false
+});
+
+print('Sampled feature count in chunk:', sampled_chunk.size());
+
+
+// ---------------------------
+// 6) EXPORT THIS CHUNK
+// ---------------------------
+
+Export.table.toDrive({
+  collection: sampled_chunk,
+  description: 'DSSAT_Climo_Daymet_2015_2024_Chunk_' + chunkStart,
+  fileFormat: 'CSV'
+});
+
+// =====================================================================
+// END
+// =====================================================================
