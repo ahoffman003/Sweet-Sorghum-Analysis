@@ -1,0 +1,71 @@
+import pandas as pd
+import glob
+import os
+
+# ------------------------------------------------------------
+# USER INPUTS
+# ------------------------------------------------------------
+
+# Folder where your chunk CSVs are located
+CHUNKS_FOLDER = r"C:\School\Fall 25\RA Sweet Sorghum\Daymet_Data\Climate_Chunks\GEE_DSSAT_Chunks"  # e.g., r"C:\DSSAT\DaymetChunks"
+
+# Glob pattern for chunk files
+CHUNK_PATTERN = os.path.join(CHUNKS_FOLDER, "DSSAT_Climo_Chunk_*.csv")
+
+# Lookup table with idx -> pointid
+LOOKUP_MAIN = r"C:\School\Fall 25\RA Sweet Sorghum\Daymet_Data\Climate_Chunks\Lookup_Tables\Station_Index_Lookup.csv"
+
+# Output folder for enriched CSVs
+OUTPUT_FOLDER = r"C:\School\Fall 25\RA Sweet Sorghum\Daymet_Data\Climate_Chunks\Daymet_Enriched"  # e.g., r"C:\DSSAT\DaymetEnriched"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# 1) LOAD LOOKUP TABLE (idx -> pointid ONLY)
+# ------------------------------------------------------------
+
+lookup = pd.read_csv(LOOKUP_MAIN)
+
+# Keep only the columns we need
+if not {"idx", "pointid"}.issubset(lookup.columns):
+    raise ValueError("Lookup table must contain 'idx' and 'pointid' columns.")
+
+lookup = lookup[["idx", "pointid"]]
+
+# idx should be unique here
+if lookup["idx"].duplicated().any():
+    raise ValueError("Lookup has duplicate idx values. Check Station_Index_Lookup_Main.csv.")
+
+print(f"Loaded lookup with {len(lookup)} stations.")
+
+
+# ------------------------------------------------------------
+# 2) PROCESS EACH CHUNK CSV
+# ------------------------------------------------------------
+
+chunk_files = sorted(glob.glob(CHUNK_PATTERN))
+print(f"Found {len(chunk_files)} chunk files.")
+
+for chunk_path in chunk_files:
+    print(f"Processing {os.path.basename(chunk_path)} ...")
+
+    chunk = pd.read_csv(chunk_path)
+
+    if "idx" not in chunk.columns:
+        raise ValueError(f"'idx' field not found in {chunk_path}. Cannot join.")
+
+    # Join pointid onto the weather chunk
+    merged = chunk.merge(lookup, on="idx", how="left")
+
+    # Optional: create a DSSAT-style weather code (e.g., W36202)
+    merged["WSTA"] = "W" + merged["pointid"].astype(str)
+
+    # Save enriched chunk
+    base = os.path.basename(chunk_path)
+    out_name = base.replace(".csv", "_with_pointid.csv")
+    out_path = os.path.join(OUTPUT_FOLDER, out_name)
+
+    merged.to_csv(out_path, index=False)
+    print(f"  -> Saved enriched file to {out_path}")
+
+print("Done processing all main chunks.")
