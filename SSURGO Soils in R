@@ -1,0 +1,179 @@
+# =========================================================================
+# R Script: SSURGO Data Extraction for DSSAT Modeling (Chunked SDA Query)
+# Author: Amanda + Gemini
+# Date: Dec 2025
+# =========================================================================
+# Reads MUKEYs, queries USDA SDA in chunks, extracts horizons from the
+# dominant component per MUKEY, maps soil properties into DSSAT-style
+# fields, and writes a CSV ready for DSSAT SBuild.
+# =========================================================================
+
+# --- 1. Setup and Configuration ------------------------------------------
+
+# install.packages(c("soilDB", "data.table"))  # Run once if needed
+
+library(soilDB)
+library(data.table)
+
+# === YOUR FILE PATHS (updated exactly as requested) ===
+input_file  <- "C:/School/Fall 25/RA Sweet Sorghum/R_Outputs/nw_mn_mukeys.txt"
+output_file <- "C:/School/Fall 25/RA Sweet Sorghum/R_Outputs/dssat_soil_profiles_raw.csv"
+
+# Chunk size for SDA queries
+chunk_size <- 200
+
+# --- 2. Read MUKEY Input File ---------------------------------------------
+
+cat("Attempting to read MUKEYs from:", input_file, "\n")
+mukey_data <- try(readLines(input_file), silent = TRUE)
+
+if (inherits(mukey_data, "try-error")) {
+  stop(paste(
+    "ERROR: Could not read input file at:", input_file,
+    "\nPlease ensure the file exists and the path is correct."
+  ))
+}
+
+mukeys <- mukey_data[nchar(mukey_data) > 0] |> unique()
+total_mukeys <- length(mukeys)
+
+if (total_mukeys == 0) {
+  stop("ERROR: No valid MUKEYs found in the input file.")
+}
+
+cat("Total MUKEYs loaded for query:", total_mukeys, "\n")
+
+# Split MUKEYs into chunks to avoid SQL length issues
+mukey_chunks <- split(mukeys, ceiling(seq_along(mukeys) / chunk_size))
+cat("MUKEYs will be queried in", length(mukey_chunks), "chunks of up to",
+    chunk_size, "each.\n")
+
+
+# --- 3. Function to Query a Chunk -----------------------------------------
+
+fetch_chunk <- function(mus, chunk_index) {
+  cat("\n--- Querying chunk", chunk_index, "with", length(mus), "MUKEYs ---\n")
+  
+  in_clause <- paste0("'", paste(mus, collapse = "','"), "'")
+  
+  q <- paste("
+    SELECT 
+      mapunit.mukey,
+      component.cokey,
+      component.compname,
+      component.comppct_r,
+      chorizon.hzname,
+      chorizon.hzdept_r,
+      chorizon.hzdepb_r,
+      chorizon.dbovendry_r,
+      chorizon.om_r,
+      chorizon.claytotal_r,
+      chorizon.silttotal_r,
+      chorizon.sandtotal_r,
+      chorizon.wthirdbar_r,
+      chorizon.wfifteenbar_r,
+      chorizon.wsatiated_r
+    FROM
+      mapunit
+    JOIN 
+      component ON mapunit.mukey = component.mukey
+    JOIN
+      chorizon ON component.cokey = chorizon.cokey
+    WHERE
+      mapunit.mukey IN (", in_clause, ")
+    ORDER BY 
+      mapunit.mukey, component.comppct_r DESC, chorizon.hzdepb_r ASC;
+  ", sep = "")
+  
+  res <- tryCatch(
+    SDA_query(q),
+    error = function(e) {
+      cat("  ! Error in chunk", chunk_index, ":", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+  
+  if (!is.null(res) && nrow(res) > 0) {
+    cat("  ✓ Retrieved", nrow(res), "horizons in chunk", chunk_index, "\n")
+  } else {
+    cat("  ! No data returned for chunk", chunk_index, "\n")
+  }
+  
+  res
+}
+
+
+# --- 4. Execute All Chunk Queries -----------------------------------------
+
+all_results_list <- vector("list", length(mukey_chunks))
+
+for (i in seq_along(mukey_chunks)) {
+  all_results_list[[i]] <- fetch_chunk(mukey_chunks[[i]], i)
+}
+
+# Drop NULLs and empty data.frames
+all_results_list <- Filter(function(x) !is.null(x) && nrow(x) > 0, all_results_list)
+
+if (length(all_results_list) == 0) {
+  stop("SDA queries returned no data. Check MUKEYs or SDA availability.")
+}
+
+soil_data_raw <- rbindlist(all_results_list, use.names = TRUE, fill = TRUE)
+
+cat("\nCombined total horizons retrieved:", nrow(soil_data_raw), "\n")
+cat("Unique MUKEYs in data:", length(unique(soil_data_raw$mukey)), "\n")
+
+
+# --- 5. Extract Dominant Component & Map to DSSAT Fields ------------------
+
+setDT(soil_data_raw)
+
+# Identify dominant component per MUKEY
+soil_data_raw[, comppct_max := max(comppct_r, na.rm = TRUE), by = mukey]
+
+# Keep horizons belonging to dominant component
+dominant_hz <- soil_data_raw[comppct_r == comppct_max]
+
+cat("Dominant components retained for",
+    length(unique(dominant_hz$mukey)), "MUKEYs.\n")
+
+
+# Map to DSSAT-style structure
+dssat_data <- dominant_hz[, .(
+  MUKEY    = mukey,
+  COKEY    = cokey,
+  COMPNAME = compname,
+  HZNAME   = hzname,
+  
+  SLT = hzdept_r,          # top depth (cm)
+  SLB = hzdepb_r,          # bottom depth (cm)
+  
+  SBDM = dbovendry_r,      # bulk density (g/cm³)
+  SLOC = om_r * 0.58,      # organic carbon %
+  SCLAY = claytotal_r,     # %
+  SSILT = silttotal_r,     # %
+  SSAND = sandtotal_r,     # %
+  SDUL  = wthirdbar_r,     # drained upper limit
+  SLLL  = wfifteenbar_r,   # wilting point
+  SSAT  = wsatiated_r      # saturation
+)]
+
+# Replace missing values with zero for DSSAT SBuild
+dssat_data[is.na(dssat_data)] <- 0
+
+dssat_data_df <- as.data.frame(dssat_data)
+
+
+# --- 6. Output ------------------------------------------------------------
+
+write.csv(dssat_data_df, output_file, row.names = FALSE)
+
+cat("\nSuccess! DSSAT-style soil profile data saved to:\n  ", output_file, "\n")
+cat("Total MUKEYs in dataset:", length(unique(dssat_data_df$MUKEY)), "\n")
+cat("Total horizon records:", nrow(dssat_data_df), "\n")
+cat("\n=========================================================================\n")
+cat("Next Step: Import the CSV into DSSAT SBuild (Soil File Builder).\n")
+cat("SBuild will aggregate horizons into DSSAT layers.\n")
+cat("=========================================================================\n")
+
+
