@@ -1,0 +1,206 @@
+# =========================================================================
+# R Script: SSURGO Data Extraction for Suitability Mapping (Chunked SDA)
+# Author: Amanda + ChatGPT
+# Date: Dec 2025
+# -------------------------------------------------------------------------
+# Reads MUKEYs, queries USDA SDA in chunks, extracts key mapunit/component/
+# horizon attributes needed for a rough sweet sorghum suitability map.
+#
+# Outputs ONE ROW PER MUKEY (dominant component) with:
+#   - Land capability class
+#   - Drainage class
+#   - Flooding frequency
+#   - Hydrologic group
+#   - Textural class (taxclname)
+#   - Effective soil depth (cm)
+#   - Surface pH (0–30 cm)
+# =========================================================================
+
+# --- 1. Setup and Configuration ------------------------------------------
+
+# install.packages(c("soilDB", "data.table", "httr", "xml2")) # Run once if needed
+
+library(soilDB)
+library(data.table)
+library("httr")
+library("xml2")
+
+input_file  <- "C:/School/Fall 25/RA Sweet Sorghum/R_Outputs/nw_mn_mukeys.txt"
+output_file <- "C:/School/Fall 25/RA Sweet Sorghum/R_Outputs/ssurgo_suitability_variables.csv"
+
+chunk_size <- 200  # MUKEYs per SDA query chunk
+
+# --- 2. Read MUKEY Input File ---------------------------------------------
+
+cat("Attempting to read MUKEYs from:", input_file, "\n")
+mukey_data <- try(readLines(input_file), silent = TRUE)
+
+if (inherits(mukey_data, "try-error")) {
+  stop(paste(
+    "ERROR: Could not read input file at:", input_file,
+    "\nPlease ensure the file exists and the path is correct."
+  ))
+}
+
+mukeys <- mukey_data[nchar(mukey_data) > 0] |> unique()
+total_mukeys <- length(mukeys)
+
+if (total_mukeys == 0) {
+  stop("ERROR: No valid MUKEYs found in the input file.")
+}
+
+cat("Total MUKEYs loaded for query:", total_mukeys, "\n")
+
+mukey_chunks <- split(mukeys, ceiling(seq_along(mukeys) / chunk_size))
+cat("MUKEYs will be queried in", length(mukey_chunks), "chunks of up to",
+    chunk_size, "each.\n")
+
+
+# --- 3. Function to Query a Chunk -----------------------------------------
+
+fetch_chunk <- function(mus, chunk_index) {
+  cat("\n--- Querying chunk", chunk_index, "with", length(mus), "MUKEYs ---\n")
+  
+  in_clause <- paste0("'", paste(mus, collapse = "','"), "'")
+  
+  # NOTE:
+  # - Land capability class from component.nirrcapcl
+  # - Drainage/flooding/hydgrp from muaggatt
+  q <- paste("
+    SELECT 
+      mapunit.mukey,
+      component.cokey,
+      component.compname,
+      component.comppct_r,
+      
+      -- Land capability class (component-level)
+      component.nirrcapcl,
+      
+      -- Mapunit aggregated attributes (dominant conditions)
+      muaggatt.drclassdcd,    -- drainage class
+      muaggatt.flodfreqdcd,   -- flooding frequency
+      muaggatt.hydgrpdcd,     -- hydrologic group
+      
+      -- Component-level context
+      component.taxclname,
+      
+      -- Horizon-level attributes used to derive depth and surface pH
+      chorizon.hzname,
+      chorizon.hzdept_r,
+      chorizon.hzdepb_r,
+      chorizon.ph1to1h2o_r   -- pH in water (1:1)
+      
+    FROM
+      mapunit
+      INNER JOIN component 
+        ON mapunit.mukey = component.mukey
+      INNER JOIN chorizon 
+        ON component.cokey = chorizon.cokey
+      LEFT JOIN muaggatt 
+        ON mapunit.mukey = muaggatt.mukey
+    WHERE
+      mapunit.mukey IN (", in_clause, ")
+    ORDER BY 
+      mapunit.mukey, component.comppct_r DESC, chorizon.hzdepb_r ASC;
+  ", sep = "")
+  
+  res <- tryCatch(
+    SDA_query(q),
+    error = function(e) {
+      cat("  ! Error in chunk", chunk_index, ":", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+  
+  if (!is.null(res) && is.data.frame(res) && nrow(res) > 0) {
+    cat("  ✓ Retrieved", nrow(res), "rows (horizons × components) in chunk", chunk_index, "\n")
+  } else {
+    cat("  ! No data returned for chunk", chunk_index, "\n")
+    res <- NULL
+  }
+  
+  res
+}
+
+
+# --- 4. Execute All Chunk Queries -----------------------------------------
+
+all_results_list <- vector("list", length(mukey_chunks))
+
+for (i in seq_along(mukey_chunks)) {
+  all_results_list[[i]] <- fetch_chunk(mukey_chunks[[i]], i)
+}
+
+all_results_list <- Filter(function(x) !is.null(x) && nrow(x) > 0, all_results_list)
+
+if (length(all_results_list) == 0) {
+  stop("SDA queries returned no data. Check MUKEYs or SDA availability.")
+}
+
+soil_data_raw <- rbindlist(all_results_list, use.names = TRUE, fill = TRUE)
+
+cat("\nCombined total rows retrieved:", nrow(soil_data_raw), "\n")
+cat("Unique MUKEYs in data:", length(unique(soil_data_raw$mukey)), "\n")
+
+# Sanity check: make sure the columns are present
+# print(names(soil_data_raw))
+
+
+# --- 5. Dominant Component & Suitability Aggregates -----------------------
+
+setDT(soil_data_raw)
+
+# Identify dominant component per MUKEY
+soil_data_raw[, comppct_max := max(comppct_r, na.rm = TRUE), by = mukey]
+
+# Keep only horizons belonging to dominant component
+dominant_hz <- soil_data_raw[comppct_r == comppct_max]
+
+cat("Dominant components retained for",
+    length(unique(dominant_hz$mukey)), "MUKEYs.\n")
+
+# Compute soil depth (max bottom depth of horizons for dominant component)
+dominant_hz[, SOIL_DEPTH_CM := max(hzdepb_r, na.rm = TRUE), by = .(mukey, cokey)]
+
+# Compute mean surface pH for 0–30 cm (dominant component)
+dominant_hz[, SURFACE_PH_0_30CM := mean(ph1to1h2o_r[hzdept_r < 30], na.rm = TRUE),
+            by = .(mukey, cokey)]
+
+# Collapse to one row per MUKEY (dominant component summary)
+suitability_soils <- unique(
+  dominant_hz[, .(
+    MUKEY             = mukey,
+    COKEY             = cokey,
+    COMPNAME          = compname,
+    COMPPCT_R         = comppct_r,
+    
+    LCC_NIRR          = nirrcapcl,    # non-irrigated capability class (I–VIII)
+    DRCLASS_DCD       = drclassdcd,   # drainage class - dominant condition
+    FLODFREQ_DCD      = flodfreqdcd,  # flooding frequency - dominant condition
+    HYDGRP_DCD        = hydgrpdcd,    # hydrologic group - dominant condition
+    
+    TAXCLNAME         = taxclname,
+    SOIL_DEPTH_CM     = SOIL_DEPTH_CM,
+    SURFACE_PH_0_30CM = SURFACE_PH_0_30CM
+  )],
+  by = c("MUKEY", "COKEY")
+)
+
+cat("Suitability summary rows:", nrow(suitability_soils), "\n")
+cat("Unique MUKEYs in summary:", length(unique(suitability_soils$MUKEY)), "\n")
+
+# Optional: clean NaNs from mean()
+is.nan.df <- function(x) do.call(cbind, lapply(x, is.nan))
+nan_mask <- is.nan.df(suitability_soils)
+suitability_soils[nan_mask] <- NA
+
+suitability_soils_df <- as.data.frame(suitability_soils)
+write.csv(suitability_soils_df, output_file, row.names = FALSE)
+
+cat("\nSuccess! Suitability-ready SSURGO variables saved to:\n  ", output_file, "\n")
+cat("Total MUKEYs in dataset:", length(unique(suitability_soils_df$MUKEY)), "\n")
+cat("Total rows (MUKEY × dominant COKEY):", nrow(suitability_soils_df), "\n")
+cat("\n=========================================================================\n")
+cat("Next Step: Join this table back to your MU polygons\n")
+cat("and use these attributes to compute your soil suitability score (0–4).\n")
+cat("=========================================================================\n")
