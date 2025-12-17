@@ -1,7 +1,5 @@
 # =========================================================================
 # R Script: SSURGO Data Extraction for Suitability Mapping (Chunked SDA)
-# Author: Amanda + ChatGPT
-# Date: Dec 2025
 # -------------------------------------------------------------------------
 # Reads MUKEYs, queries USDA SDA in chunks, extracts key mapunit/component/
 # horizon attributes needed for a rough sweet sorghum suitability map.
