@@ -1,0 +1,124 @@
+// =================================================================================
+// 1. Define Parameters and Region of Interest (ROI)
+// =================================================================================
+
+// Define Time Period: 2014 to 2024
+var START_YEAR = 2014;
+var END_YEAR = 2024;
+var START_DATE = ee.Date(START_YEAR + '-01-01'); 
+var END_DATE = ee.Date(END_YEAR + '-12-31');     
+
+// Define Sweet Sorghum GDD parameters
+var T_base = 10;    // Base Temperature in C (10C or 50F)
+var T_max_cap = 30; // Maximum Cutoff Temperature in C (30C or 86F)
+
+// Define Minnesota Boundary (ROI)
+var minnesota_bounds = ee.Geometry.Rectangle([-97.24, 43.49, -89.57, 49.38]);
+var ROI = minnesota_bounds; 
+
+// Set the map view to Minnesota
+Map.setCenter(-94.5, 46.5, 6);
+
+// =================================================================================
+// 2. Load and Filter Data
+// =================================================================================
+
+// Load and Filter the DAYMET V4 Dataset
+var daymet = ee.ImageCollection('NASA/ORNL/DAYMET_V4')
+  .filterBounds(ROI)
+  .filterDate(START_DATE, END_DATE)
+  .select('tmin', 'tmax');
+
+// =================================================================================
+// 3. Growing Degree Day (GDD) Calculation Function
+// =================================================================================
+
+/**
+ * Calculates daily Modified Growing Degree Days (MGDD) for Sweet Sorghum.
+ */
+var calculateDailyGDD = function(image) {
+  var tmin = image.select('tmin');
+  var tmax = image.select('tmax');
+
+  // Apply maximum capping to Tmax
+  var tmax_capped = tmax.min(T_max_cap);
+
+  // Apply minimum flooring to Tmin
+  var tmin_floored = tmin.max(T_base);
+
+  // Calculate the daily mean temperature
+  var tmean = tmax_capped.add(tmin_floored).divide(2);
+
+  // Calculate GDD: Tmean - T_base, ensuring result is never negative
+  var gdd = tmean.subtract(T_base)
+    .max(0)
+    .rename('GDD');
+
+  return image.addBands(gdd).copyProperties(image, ['system:time_start']);
+};
+
+// Apply the daily GDD calculation to the ImageCollection
+var dailyGDD = daymet.map(calculateDailyGDD).select('GDD');
+
+// =================================================================================
+// 4. Aggregate Daily GDD to Annual Totals
+// =================================================================================
+
+var years = ee.List.sequence(START_YEAR, END_YEAR);
+
+var annualGDD = ee.ImageCollection.fromImages(
+  years.map(function(year) {
+    
+    // --- CORRECTED LINE FOR FORMAT ERROR ---
+    // Convert ee.Number 'year' to a string for use in date and renaming
+    var yearString = ee.Number(year).toInt().format('%d'); // Use toInt() for safety
+    // ---------------------------------------
+
+    // Corrected date constructor using string format: 'YYYY-MM-DD'
+    var yearStart = ee.Date(yearString.cat('-01-01')); 
+    var yearEnd = yearStart.advance(1, 'year');
+    
+    // Filter the daily GDD collection for the current year and sum them up
+    var yearlyCollection = dailyGDD.filterDate(yearStart, yearEnd);
+    
+    var annualSum = yearlyCollection.sum()
+      .set('system:index', yearString)
+      .set('year', year)
+      .rename(ee.String('Annual_GDD_').cat(yearString)); // Use ee.String.cat() for renaming
+      
+    // Clip the result to the ROI
+    return annualSum.clip(ROI);
+  })
+);
+
+// =================================================================================
+// 5. Visualization (Optional) and Export
+// =================================================================================
+
+// Visualization parameters for GDD
+var gdd_vis = {
+  min: 500,
+  max: 3500,
+  palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red'], 
+};
+
+// Add the 2023 annual GDD to the map for inspection
+var annualGDD2023 = annualGDD.filterMetadata('year', 'equals', 2023).first();
+Map.addLayer(annualGDD2023, gdd_vis, '2023 Annual GDD (Sorghum)');
+
+// Export the ImageCollection containing annual GDD for 2014-2024 to Google Drive.
+// This loop initiates 11 separate export tasks.
+var imageList = annualGDD.toList(annualGDD.size());
+for (var i = 0; i < imageList.size().getInfo(); i++) {
+  var image = ee.Image(imageList.get(i));
+  var year = image.get('year').getInfo();
+  
+  Export.image.toDrive({
+    image: image,
+    description: 'Annual_Sorghum_GDD_MN_' + year,
+    folder: 'GEE_Sorghum_GDD', // Files will go into this folder in your Google Drive
+    scale: 1000, // Daymet V4 resolution
+    region: ROI,
+    maxPixels: 1e13
+  });
+}
